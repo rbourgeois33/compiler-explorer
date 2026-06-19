@@ -125,6 +125,8 @@ export {NixCompiler} from './nix.js';
 export {NorcroftCompiler} from './norcroft.js';
 export {NumbaCompiler} from './numba.js';
 export {NvccCompiler} from './nvcc.js';
+export {ScaleNvccNvidiaCompiler} from './scale-nvcc-nvidia.js';
+export {ScaleNvccAMDCompiler} from './scale-nvcc-amd.js';
 export {NvcppCompiler} from './nvcpp.js';
 export {NvrtcCompiler} from './nvrtc.js';
 export {OCamlCompiler} from './ocaml.js';

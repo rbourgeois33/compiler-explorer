@@ -1,0 +1,290 @@
+// Copyright (c) 2018, Compiler Explorer Authors
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//     * Redistributions of source code must retain the above copyright notice,
+//       this list of conditions and the following disclaimer.
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+import * as fs from 'node:fs/promises';
+import Path from 'node:path';
+
+import Semver from 'semver';
+import _ from 'underscore';
+
+import type {CompilationInfo, CompilationResult} from '../../types/compilation/compilation.interfaces.js';
+import type {PreliminaryCompilerInfo} from '../../types/compiler.interfaces.js';
+import type {ParseFiltersAndOutputOptions} from '../../types/features/filters.interfaces.js';
+import {unwrap} from '../assert.js';
+import {BaseCompiler} from '../base-compiler.js';
+import {CompilationEnvironment} from '../compilation-env.js';
+import {PTXAsmParser} from '../parsers/asm-parser-ptx.js';
+import {SassAsmParser} from '../parsers/asm-parser-sass.js';
+import {asSafeVer} from '../utils.js';
+import {ClangParser} from './argument-parsers.js';
+
+export class ScaleNvccAMDCompiler extends BaseCompiler {
+    static get key() {
+        return 'scale-nvcc-amd';
+    }
+
+    deviceAsmParser: SassAsmParser;
+    ptxParser: PTXAsmParser;
+
+    constructor(info: PreliminaryCompilerInfo, env: CompilationEnvironment) {
+        super(info, env);
+        this.compiler.supportsOptOutput = true;
+        this.compiler.supportsDeviceAsmView = true;
+        this.deviceAsmParser = new SassAsmParser(this.compilerProps);
+        this.ptxParser = new PTXAsmParser(this.compilerProps);
+    }
+
+    // TODO: (for all of CUDA)
+    // * lots of whitespace from nvcc
+    // * would be nice to try and filter unused `.func`s from e.g. clang output
+
+    // TEMP: -o commented out because scale can't combine an explicit `-o`
+    // with `-Xcompiler=-S`. This means scale (and now nvcc too, while this
+    // is shared) falls back to basename-derived default naming instead of
+    // a predictable `output.s`. See findHostAsmFile()/extractDeviceCode()
+    // below, which auto-detect either naming convention.
+    override optionsForFilter(filters: ParseFiltersAndOutputOptions, outputFilename: string, userOptions?: string[]) {
+        // const opts = ['-o', this.filename(outputFilename), '-g', '-lineinfo', '--keep-device-functions'];
+        const opts = ['-g', '-lineinfo', '--keep-device-functions'];
+        if (!filters.execute) {
+            opts.push('-c', '-keep', '-keep-dir', Path.dirname(outputFilename));
+            if (!filters.binary) {
+                opts.push('-Xcompiler=-S');
+            }
+        }
+        return opts;
+    }
+
+    override getArgumentParserClass() {
+        return ClangParser;
+    }
+
+    override optOutputRequested(options: string[]) {
+        return (
+            super.optOutputRequested(options) ||
+            options.includes('--optimization-info') ||
+            options.includes('-opt-info')
+        );
+    }
+
+    // async nvdisasm(outputFilename: string, result: any, maxOutput: number) {
+    //     const {nvdisasm, semver} = this.compiler;
+
+    //     const args = Semver.lt(asSafeVer(semver), '11.0.0', true)
+    //         ? [outputFilename, '-c', '-g']
+    //         : [outputFilename, '-c', '-g', '-hex'];
+
+    //     const {code, execTime, stdout} = await this.exec(unwrap(nvdisasm), args, {
+    //         maxOutput,
+    //         customCwd: result.dirPath,
+    //     });
+
+    //     if (code === 0) {
+    //         result.objdumpTime = execTime;
+    //         result.asm = this.postProcessObjdumpOutput(stdout);
+    //     } else {
+    //         result.asm = `<No output: ${Path.basename(unwrap(nvdisasm))} returned ${code}>`;
+    //     }
+    //     return result;
+    // }
+
+    // TEMP (scale support): matches scale's per-target device output, e.g.
+    // `example-cuda-nvptx64-nvidia-cuda-sm_75.s`. Captured group is the
+    // arch (sm_75). The host-side file (`example.s`) never matches this,
+    // since it lacks the `-cuda-nvptx64-nvidia-cuda-` infix.
+    private static readonly scaleDeviceFileRe = /-cuda-amdgcn-amd-amdhsa-scale-(gfx[^./]+)\.s$/;
+
+    // TEMP (scale support): with `-o` omitted, find whichever `.s` file in
+    // dirPath is the host output (i.e. not one of the per-arch device
+    // files). Returns null if nothing matches (e.g. plain nvcc still using
+    // its own default naming, or compile actually failed).
+    private async findHostAsmFile(dirPath: string): Promise<string | null> {
+        try {
+            const files = await fs.readdir(dirPath);
+            const hostFile = files.find(f => f.endsWith('.s') && !ScaleNvccAMDCompiler.scaleDeviceFileRe.test(f));
+            return hostFile ? Path.join(dirPath, hostFile) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    override async postProcess(result, outputFilename: string, filters: ParseFiltersAndOutputOptions) {
+        // TEMP (scale support): outputFilename as originally computed may not
+        // exist since we no longer pass `-o`. Try to recover the real file.
+        if (!filters.binary && result.dirPath) {
+            try {
+                await fs.stat(outputFilename);
+            } catch {
+                const hostAsm = await this.findHostAsmFile(result.dirPath);
+                if (hostAsm) {
+                    try {
+                        result.asmSize = (await fs.stat(hostAsm)).size;
+                    } catch {
+                        // leave asmSize as-is; base behaviour reports "no output" below
+                    }
+                    outputFilename = hostAsm;
+                }
+            }
+        }
+
+        const maxSize = this.env.ceProps('max-asm-size', 64 * 1024 * 1024);
+        const optPromise = result.optPath ? this.processOptOutput(result.optPath) : Promise.resolve([]);
+        const postProcess = _.compact(this.compiler.postProcess);
+        const asmPromise = (
+            filters.binary
+                ? this.objdump(outputFilename, {}, maxSize, !!filters.intel, !!filters.demangle, false, false, filters)
+                : (async () => {
+                      if (result.asmSize === undefined) {
+                          result.asm = '<No output file>';
+                          return result;
+                      }
+                      if (result.asmSize >= maxSize) {
+                          result.asm =
+                              '<No output: generated assembly was too large' +
+                              ` (${result.asmSize} > ${maxSize} bytes)>`;
+                          return result;
+                      }
+                      if (postProcess.length > 0) {
+                          return await this.execPostProcess(result, postProcess, outputFilename, maxSize);
+                      }
+                      const contents = await fs.readFile(outputFilename, {encoding: 'utf8'});
+                      result.asm = contents.toString();
+                      return result;
+                  })()
+        ).then(asm => {
+            result.asm = typeof asm === 'string' ? asm : asm.asm;
+            return result;
+        });
+        return Promise.all([asmPromise, optPromise, []]);
+    }
+
+    // Matches the start/end of a GAS inline-assembly block emitted by the host compiler.
+    private static readonly appBlockStartRe = /^#APP\b/;
+    private static readonly appBlockEndRe = /^#NO_APP\b/;
+    // Matches the .nv_fatbin section directive that NVCC injects to hold the fat binary blob.
+    private static readonly nvFatBinSectionRe = /^\s*\.section\s+\.nv_fatbin\b/;
+
+    /**
+     * Strip `#APP`/`#NO_APP` inline-assembly blocks that contain a `.nv_fatbin`
+     * section from the host-side x86 assembly.  These blocks hold the raw CUDA
+     * fat binary blob (the `fatbinData` label followed by hundreds of `.quad`
+     * hex lines) which is never useful to inspect in the asm view.
+     *
+     * Only blocks that contain `.nv_fatbin` are removed; any `#APP`/`#NO_APP`
+     * blocks originating from genuine user inline-assembly are left intact.
+     */
+    protected removeNvccFatbinaryBlob(asm: string): string {
+        const lines = asm.split('\n');
+        const result: string[] = [];
+        let inAppBlock = false;
+        let hasFatBin = false;
+        let appBuffer: string[] = [];
+
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (ScaleNvccAMDCompiler.appBlockStartRe.test(trimmed)) {
+                inAppBlock = true;
+                hasFatBin = false;
+                appBuffer = [line];
+            } else if (ScaleNvccAMDCompiler.appBlockEndRe.test(trimmed)) {
+                inAppBlock = false;
+                if (!hasFatBin) {
+                    // Not a fat-binary block — keep it
+                    appBuffer.push(line);
+                    result.push(...appBuffer);
+                }
+                appBuffer = [];
+            } else if (inAppBlock) {
+                if (ScaleNvccAMDCompiler.nvFatBinSectionRe.test(line)) {
+                    hasFatBin = true;
+                }
+                appBuffer.push(line);
+            } else {
+                result.push(line);
+            }
+        }
+
+        // Handle (malformed) unclosed #APP block: keep it
+        if (appBuffer.length > 0) {
+            result.push(...appBuffer);
+        }
+
+        return result.join('\n');
+    }
+
+    override async processAsm(result, filters: ParseFiltersAndOutputOptions, options: string[]) {
+        if (filters.labels && typeof result.asm === 'string') {
+            result = {...result, asm: this.removeNvccFatbinaryBlob(result.asm)};
+        }
+        return super.processAsm(result, filters, options);
+    }
+
+    override async extractDeviceCode(
+        result: CompilationResult,
+        filters: ParseFiltersAndOutputOptions,
+        compilationInfo: CompilationInfo,
+    ) {
+        const {dirPath} = result;
+        const {demangle} = filters;
+        const devices = {...result.devices};
+        if (dirPath) {
+            const files = await fs.readdir(dirPath);
+            const maxSize = this.env.ceProps('max-asm-size', 64 * 1024 * 1024);
+            await Promise.all(
+                files
+                    .filter(
+                        f =>
+                            f.endsWith('.ptx') ||
+                            f.endsWith('.cubin') ||
+                            ScaleNvccAMDCompiler.scaleDeviceFileRe.test(f),
+                    )
+                    .map(async name => {
+                        const scaleMatch = name.match(ScaleNvccAMDCompiler.scaleDeviceFileRe);
+                        const isCubin = name.endsWith('.cubin');
+                        const type = isCubin ? 'SASS' : 'PTX';
+                        // const {asm} =
+                        //     type === 'SASS'
+                        //         ? await this.nvdisasm(Path.join(dirPath, name), {dirPath}, maxSize)
+                        //         : {asm: await fs.readFile(Path.join(dirPath, name), 'utf8')};
+
+                        const {asm} = {asm: await fs.readFile(Path.join(dirPath, name), 'utf8')};
+                        const archAndCode = scaleMatch ? scaleMatch[1] : name.split('.').slice(1, -1).join(', ') || '';
+                        const nameAndArch = type + (archAndCode ? ` (${archAndCode.toLowerCase()})` : '');
+                        const parser = type === 'PTX' ? this.ptxParser : this.deviceAsmParser;
+                        Object.assign(devices, {
+                            [nameAndArch]: await this.postProcessAsm(
+                                {
+                                    okToCache: demangle,
+                                    ...parser.process(asm, {...filters, binary: type === 'SASS'}),
+                                },
+                                {...filters, binary: type === 'SASS'},
+                            ),
+                        });
+                    }),
+            );
+            result.devices = devices;
+        }
+        return result;
+    }
+}
