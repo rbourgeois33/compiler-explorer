@@ -120,14 +120,31 @@ export class ScaleNvccAMDCompiler extends BaseCompiler {
     // files). Returns null if nothing matches (e.g. plain nvcc still using
     // its own default naming, or compile actually failed).
     private async findHostAsmFile(dirPath: string): Promise<string | null> {
-        try {
-            const files = await fs.readdir(dirPath);
-            const hostFile = files.find(f => f.endsWith('.s') && !ScaleNvccAMDCompiler.scaleDeviceFileRe.test(f));
-            return hostFile ? Path.join(dirPath, hostFile) : null;
-        } catch {
-            return null;
+            try {
+                const files = await fs.readdir(dirPath);
+    
+                console.log('all files:', files);
+    
+                const hostFiles = files.filter(
+                    f =>
+                        f.endsWith('.s') &&
+                        !ScaleNvccAMDCompiler.scaleDeviceFileRe.test(f)
+                );
+
+                console.log('Host ASM candidates:', hostFiles);
+    
+                if (hostFiles.length !== 1) {
+                    console.warn(
+                        `Expected exactly one host .s file, found ${hostFiles.length}`
+                    );
+                    return null;
+                }
+    
+                return Path.join(dirPath, hostFiles[0]);
+            } catch {
+                return null;
+            }
         }
-    }
 
     override async postProcess(result, outputFilename: string, filters: ParseFiltersAndOutputOptions) {
         // TEMP (scale support): outputFilename as originally computed may not

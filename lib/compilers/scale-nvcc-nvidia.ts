@@ -123,6 +123,8 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
         try {
             const files = await fs.readdir(dirPath);
 
+            console.log('all files:', files);
+
             const hostFiles = files.filter(
                 f =>
                     f.endsWith('.s') &&
