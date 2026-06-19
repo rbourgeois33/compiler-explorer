@@ -122,8 +122,23 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
     private async findHostAsmFile(dirPath: string): Promise<string | null> {
         try {
             const files = await fs.readdir(dirPath);
-            const hostFile = files.find(f => f.endsWith('.s') && !ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f));
-            return hostFile ? Path.join(dirPath, hostFile) : null;
+
+            const hostFiles = files.filter(
+                f =>
+                    f.endsWith('.s') &&
+                    !ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f)
+            );
+
+            console.log('Host ASM candidates:', hostFiles);
+
+            if (hostFiles.length !== 1) {
+                console.warn(
+                    `Expected exactly one host .s file, found ${hostFiles.length}`
+                );
+                return null;
+            }
+
+            return Path.join(dirPath, hostFiles[0]);
         } catch {
             return null;
         }
