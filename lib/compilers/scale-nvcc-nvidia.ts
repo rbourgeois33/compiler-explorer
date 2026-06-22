@@ -88,26 +88,6 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
         );
     }
 
-    async nvdisasm(outputFilename: string, result: any, maxOutput: number) {
-        const {nvdisasm, semver} = this.compiler;
-
-        const args = Semver.lt(asSafeVer(semver), '11.0.0', true)
-            ? [outputFilename, '-c', '-g']
-            : [outputFilename, '-c', '-g', '-hex'];
-
-        const {code, execTime, stdout} = await this.exec(unwrap(nvdisasm), args, {
-            maxOutput,
-            customCwd: result.dirPath,
-        });
-
-        if (code === 0) {
-            result.objdumpTime = execTime;
-            result.asm = this.postProcessObjdumpOutput(stdout);
-        } else {
-            result.asm = `<No output: ${Path.basename(unwrap(nvdisasm))} returned ${code}>`;
-        }
-        return result;
-    }
 
     // TEMP (scale support): matches scale's per-target device output, e.g.
     // `example-cuda-nvptx64-nvidia-cuda-sm_75.s`. Captured group is the
@@ -265,36 +245,122 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
         const {dirPath} = result;
         const {demangle} = filters;
         const devices = {...result.devices};
+
         if (dirPath) {
             const files = await fs.readdir(dirPath);
             const maxSize = this.env.ceProps('max-asm-size', 64 * 1024 * 1024);
+
+            console.log('[extractDeviceCode]: dirPath', dirPath);
+            console.log('[extractDeviceCode]: all files at start', files);
+
             await Promise.all(
                 files
-                    .filter(f => f.endsWith('.ptx') || f.endsWith('.cubin') || ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f))
+                    .filter(f => ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f))
                     .map(async name => {
+                        console.log('[extractDeviceCode]: ---- processing file:', name);
+
                         const scaleMatch = name.match(ScaleNvccNvidiaCompiler.scaleDeviceFileRe);
-                        const isCubin = name.endsWith('.cubin');
-                        const type = isCubin ? 'SASS' : 'PTX';
-                        const {asm} =
-                            type === 'SASS'
-                                ? await this.nvdisasm(Path.join(dirPath, name), {dirPath}, maxSize)
-                                : {asm: await fs.readFile(Path.join(dirPath, name), 'utf8')};
-                        const archAndCode = scaleMatch ? scaleMatch[1] : name.split('.').slice(1, -1).join(', ') || '';
-                        const nameAndArch = type + (archAndCode ? ` (${archAndCode.toLowerCase()})` : '');
-                        const parser = type === 'PTX' ? this.ptxParser : this.deviceAsmParser;
+                        console.log('[extractDeviceCode]: scaleMatch', scaleMatch);
+
+                        const asm = await fs.readFile(Path.join(dirPath, name), 'utf8');
+                        console.log('[extractDeviceCode]: read PTX .s file, length', asm.length);
+                        console.log('[extractDeviceCode]: PTX .s preview:\n', asm.slice(0, 300));
+
+                        const archAndCode = scaleMatch[1];
+                        console.log('[extractDeviceCode]: archAndCode', archAndCode);
+
+                        const nameAndArch = `PTX` + (archAndCode ? ` (${archAndCode.toLowerCase()})` : '');
+                        console.log('[extractDeviceCode]: nameAndArch', nameAndArch);
+
                         Object.assign(devices, {
                             [nameAndArch]: await this.postProcessAsm(
                                 {
                                     okToCache: demangle,
-                                    ...parser.process(asm, {...filters, binary: type === 'SASS'}),
+                                    ...this.ptxParser.process(asm, {...filters, binary: false}),
                                 },
-                                {...filters, binary: type === 'SASS'},
+                                {...filters, binary: false},
                             ),
                         });
+                        console.log('[extractDeviceCode]: PTX device entry written for', nameAndArch);
+
+                        //
+                        // PTX -> CUBIN with ptxas
+                        //
+                        const cubinPath = Path.join(dirPath, `${Path.basename(name, '.s')}.cubin`);
+                        const ptxasCmd = '/product/ubuntu24-x86_64/apps/CUDA/12.8.0/bin/ptxas';
+                        const ptxasArgs = ['-arch', archAndCode, name, '-o', cubinPath];
+                        console.log('[extractDeviceCode]: running ptxas:', ptxasCmd, ptxasArgs.join(' '));
+                        console.log('[extractDeviceCode]: ptxas cwd:', dirPath);
+
+                        try {
+                            const ptxasResult = await this.exec(ptxasCmd, ptxasArgs, {customCwd: dirPath});
+                            console.log('[extractDeviceCode]: ptxas exit code', ptxasResult.code);
+                            console.log('[extractDeviceCode]: ptxas stdout', ptxasResult.stdout);
+                            console.log('[extractDeviceCode]: ptxas stderr', ptxasResult.stderr);
+
+                            const filesAfterPtxas = await fs.readdir(dirPath);
+                            console.log('[extractDeviceCode]: files after ptxas', filesAfterPtxas);
+
+                            let cubinSize: number | null = null;
+                            try {
+                                cubinSize = (await fs.stat(cubinPath)).size;
+                            } catch {
+                                console.warn('[extractDeviceCode]: cubin file does not exist at', cubinPath);
+                            }
+                            console.log('[extractDeviceCode]: cubin size bytes', cubinSize);
+
+                            if (ptxasResult.code !== 0) {
+                                console.warn('[extractDeviceCode]: ptxas failed, skipping SASS');
+                                return;
+                            }
+
+                            //
+                            // CUBIN -> SASS with nvdisasm
+                            //
+                            const nvdisasmCmd = '/product/ubuntu24-x86_64/apps/CUDA/12.8.0/bin/nvdisasm';
+                            const nvdisasmArgs = [cubinPath];
+                            console.log('[extractDeviceCode]: running nvdisasm:', nvdisasmCmd, nvdisasmArgs.join(' '));
+                            console.log('[extractDeviceCode]: nvdisasm cwd:', dirPath);
+
+                            const {code, stdout} = await this.exec(nvdisasmCmd, nvdisasmArgs, {customCwd: dirPath});
+                            console.log('[extractDeviceCode]: nvdisasm exit code', code);
+                            console.log('[extractDeviceCode]: nvdisasm stdout length', stdout.length);
+                            console.log('[extractDeviceCode]: nvdisasm stdout \n', stdout);
+
+                            const filesAfterNvdisasm = await fs.readdir(dirPath);
+                            console.log('[extractDeviceCode]: files after nvdisasm', filesAfterNvdisasm);
+
+                            const sassAsm = code === 0
+                                ? this.postProcessObjdumpOutput(stdout)
+                                : `<nvdisasm failed with code ${code}>`;
+                            console.log('[extractDeviceCode]: sassAsm length after postProcess', sassAsm.length);
+                            console.log('[extractDeviceCode]: sassAsm:\n', sassAsm);
+
+                            const sassNameAndArch = `SASS` + (archAndCode ? ` (${archAndCode.toLowerCase()})` : '');
+                            console.log('[extractDeviceCode]: writing SASS device entry for', sassNameAndArch);
+
+                            Object.assign(devices, {
+                                [sassNameAndArch]: await this.postProcessAsm(
+                                    {
+                                        okToCache: demangle,
+                                        ...this.deviceAsmParser.process(sassAsm, {...filters, binary: false}),
+                                    },
+                                    {...filters, binary: false},
+                                ),
+                            });
+                            console.log('[extractDeviceCode]: SASS device entry written for', sassNameAndArch);
+                            console.log('[extractDeviceCode]: devices keys now', Object.keys(devices));
+
+                        } catch (err) {
+                            console.error('[extractDeviceCode]: exception during SASS generation', err);
+                        }
                     }),
             );
+
+            console.log('[extractDeviceCode]: final devices keys', Object.keys(devices));
             result.devices = devices;
         }
+
         return result;
     }
 }
