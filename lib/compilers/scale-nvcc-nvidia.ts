@@ -1,28 +1,5 @@
-// Copyright (c) 2018, Compiler Explorer Authors
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-//     * Redistributions of source code must retain the above copyright notice,
-//       this list of conditions and the following disclaimer.
-//     * Redistributions in binary form must reproduce the above copyright
-//       notice, this list of conditions and the following disclaimer in the
-//       documentation and/or other materials provided with the distribution.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-
 import * as fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import Path from 'node:path';
 
 import Semver from 'semver';
@@ -39,6 +16,12 @@ import {SassAsmParser} from '../parsers/asm-parser-sass.js';
 import {asSafeVer} from '../utils.js';
 import {ClangParser} from './argument-parsers.js';
 
+interface ExecResult {
+    code: number;
+    stdout: string;
+    stderr: string;
+}
+
 export class ScaleNvccNvidiaCompiler extends BaseCompiler {
     static get key() {
         return 'scale-nvcc-nvidia';
@@ -47,17 +30,26 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
     deviceAsmParser: SassAsmParser;
     ptxParser: PTXAsmParser;
 
+    // Same convention clang.ts uses for llvm-dis: prefer the copy that sits
+    // next to the compiler exe, fall back to an explicit `llvmDisassembler`
+    // property. Undefined means "couldn't find one" — handled gracefully
+    // at the call site, same as upstream.
+    protected llvmDisassemblerPath?: string;
+
     constructor(info: PreliminaryCompilerInfo, env: CompilationEnvironment) {
         super(info, env);
         this.compiler.supportsOptOutput = true;
         this.compiler.supportsDeviceAsmView = true;
         this.deviceAsmParser = new SassAsmParser(this.compilerProps);
         this.ptxParser = new PTXAsmParser(this.compilerProps);
-    }
 
-    // TODO: (for all of CUDA)
-    // * lots of whitespace from nvcc
-    // * would be nice to try and filter unused `.func`s from e.g. clang output
+        const llvmDisassemblerPath = Path.join(Path.dirname(this.compiler.exe), 'llvm-dis');
+        if (fsSync.existsSync(llvmDisassemblerPath)) {
+            this.llvmDisassemblerPath = llvmDisassemblerPath;
+        } else {
+            this.llvmDisassemblerPath = this.compilerProps<string | undefined>('llvmDisassembler');
+        }
+    }
 
     // TEMP: -o commented out because scale can't combine an explicit `-o`
     // with `-Xcompiler=-S`. This means scale (and now nvcc too, while this
@@ -88,12 +80,16 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
         );
     }
 
-
     // TEMP (scale support): matches scale's per-target device output, e.g.
     // `example-cuda-nvptx64-nvidia-cuda-sm_75.s`. Captured group is the
     // arch (sm_75). The host-side file (`example.s`) never matches this,
     // since it lacks the `-cuda-nvptx64-nvidia-cuda-` infix.
     private static readonly scaleDeviceFileRe = /-cuda-nvptx64-nvidia-cuda-([^./]+)\.s$/;
+
+    // TEMP (scale support): same per-target naming convention, but for the
+    // device-side LLVM bitcode scale/nvcc leaves behind with `-keep` (e.g.
+    // `example-cuda-nvptx64-nvidia-cuda-sm_75.bc`), prior to PTX codegen.
+    private static readonly scaleDeviceBcFileRe = /-cuda-nvptx64-nvidia-cuda-([^./]+)\.bc$/;
 
     // TEMP (scale support): with `-o` omitted, find whichever `.s` file in
     // dirPath is the host output (i.e. not one of the per-arch device
@@ -103,20 +99,14 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
         try {
             const files = await fs.readdir(dirPath);
 
-            console.log('all files:', files);
+            //console.log('all files:', files);
 
-            const hostFiles = files.filter(
-                f =>
-                    f.endsWith('.s') &&
-                    !ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f)
-            );
+            const hostFiles = files.filter(f => f.endsWith('.s') && !ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f));
 
-            console.log('Host ASM candidates:', hostFiles);
+            //console.log('Host ASM candidates:', hostFiles);
 
             if (hostFiles.length !== 1) {
-                console.warn(
-                    `Expected exactly one host .s file, found ${hostFiles.length}`
-                );
+                console.warn(`Expected exactly one host .s file, found ${hostFiles.length}`);
                 return null;
             }
 
@@ -158,8 +148,7 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
                       }
                       if (result.asmSize >= maxSize) {
                           result.asm =
-                              '<No output: generated assembly was too large' +
-                              ` (${result.asmSize} > ${maxSize} bytes)>`;
+                              '<No output: generated assembly was too large' + ` (${result.asmSize} > ${maxSize} bytes)>`;
                           return result;
                       }
                       if (postProcess.length > 0) {
@@ -237,6 +226,161 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
         return super.processAsm(result, filters, options);
     }
 
+    // ---- device-code extraction helpers -------------------------------------------------
+
+    /** Pulls the captured arch (e.g. `sm_75`) out of a scale per-target device filename. */
+    private static archFromDeviceFileName(name: string, re: RegExp): string {
+        return unwrap(name.match(re))[1];
+    }
+
+    private async runPtxas(ptxFileName: string, cubinPath: string, arch: string, dirPath: string): Promise<ExecResult> {
+        const {ptxas} = this.compiler; 
+        const args = ['-arch', arch, ptxFileName, '-o', cubinPath];
+        console.log('[runPtxas]: running', ptxas, args.join(' '));
+        return this.exec(ptxas, args, {customCwd: dirPath});
+    }
+
+    private async runNvdisasm(cubinPath: string, dirPath: string): Promise<ExecResult> {
+        const {nvdisasm} = this.compiler; 
+        const args = [cubinPath, '-c', '-g', '-hex'];
+        console.log('[runNvdisasm]: running', nvdisasm, args.join(' '));
+
+        return this.exec(unwrap(nvdisasm), args, {customCwd: dirPath});
+    }
+
+    private async runLlvmDis(bcPath: string, dirPath: string): Promise<ExecResult> {
+        //console.log('[runLlvmDis]: running', this.llvmDisassemblerPath, bcPath);
+
+        const result = await this.exec(unwrap(this.llvmDisassemblerPath), [bcPath], {customCwd: dirPath});
+
+        //console.log('[runLlvmDis]: exit code', result.code);
+        if (result.stderr) console.log('[runLlvmDis]: stderr', result.stderr);
+
+        return result;
+    }
+
+    /**
+     * Handles a single scale/nvcc device `.s` (PTX) file: registers it under
+     * `PTX (<arch>)`, then pipes it through ptxas -> nvdisasm to also
+     * register the corresponding `SASS (<arch>)` entry.
+     */
+    private async processPtxFile(
+        name: string,
+        dirPath: string,
+        filters: ParseFiltersAndOutputOptions,
+        demangle: boolean,
+        devices: Record<string, unknown>,
+    ): Promise<void> {
+        const archAndCode = ScaleNvccNvidiaCompiler.archFromDeviceFileName(name, ScaleNvccNvidiaCompiler.scaleDeviceFileRe);
+
+        const asm = await fs.readFile(Path.join(dirPath, name), 'utf8');
+
+        const ptxNameAndArch = `PTX (${archAndCode.toLowerCase()})`;
+        devices[ptxNameAndArch] = await this.postProcessAsm(
+            {
+                okToCache: demangle,
+                ...this.ptxParser.process(asm, {...filters, binary: false}),
+            },
+            {...filters, binary: false},
+        );
+
+        //
+        // PTX -> CUBIN -> SASS
+        //
+        const cubinPath = Path.join(dirPath, `${Path.basename(name, '.s')}.cubin`);
+
+        let ptxasResult: ExecResult;
+        try {
+            ptxasResult = await this.runPtxas(name, cubinPath, archAndCode, dirPath);
+        } catch (err) {
+            console.error('[processPtxFile]: exception running ptxas for', name, err);
+            return;
+        }
+
+        if (ptxasResult.code !== 0) {
+            console.warn('[processPtxFile]: ptxas failed for', name, '- skipping SASS');
+            return;
+        }
+
+        let nvdisasmResult: ExecResult;
+        try {
+            nvdisasmResult = await this.runNvdisasm(cubinPath, dirPath);
+        } catch (err) {
+            console.error('[processPtxFile]: exception running nvdisasm for', cubinPath, err);
+            return;
+        }
+
+        const sassAsm =
+            nvdisasmResult.code === 0
+                ? this.postProcessObjdumpOutput(nvdisasmResult.stdout)
+                : `<nvdisasm failed with code ${nvdisasmResult.code}>`;
+
+        const sassNameAndArch = `SASS (${archAndCode.toLowerCase()})`;
+        devices[sassNameAndArch] = await this.postProcessAsm(
+            {
+                okToCache: demangle,
+                ...this.deviceAsmParser.process(sassAsm, {...filters, binary: true}),
+            },
+            {...filters, binary: true},
+        );
+    }
+
+    /**
+     * Handles a single scale/nvcc device `.bc` (LLVM bitcode) file: runs
+     * `llvm-dis` to get readable LLVM IR text (clang.ts's
+     */
+    private async processBcDeviceFile(
+        name: string,
+        dirPath: string,
+        filters: ParseFiltersAndOutputOptions,
+        demangle: boolean,
+        devices: Record<string, unknown>,
+    ): Promise<void> {
+        const archAndCode = ScaleNvccNvidiaCompiler.archFromDeviceFileName(
+            name,
+            ScaleNvccNvidiaCompiler.scaleDeviceBcFileRe,
+        );
+
+        const irNameAndArch = `Device LLVM IR (${archAndCode.toLowerCase()})`;
+
+        if (!this.llvmDisassemblerPath) {
+            devices[irNameAndArch] = await this.postProcessAsm(
+                {
+                    okToCache: false,
+                    ...this.llvmIr.process('<error: no llvm-dis found to disassemble bitcode>', {
+                        ...filters,
+                        binary: false,
+                    }),
+                },
+                {...filters, binary: false},
+            );
+            return;
+        }
+
+        const bcPath = Path.join(dirPath, name);
+        const llPath = Path.join(dirPath, `${Path.basename(name, '.bc')}.ll`);
+
+        let irText: string;
+        try {
+            const disResult = await this.runLlvmDis(bcPath, dirPath);
+            irText =
+                disResult.code === 0
+                    ? await fs.readFile(llPath, 'utf8')
+                    : `<llvm-dis failed with code ${disResult.code}>`;
+        } catch (err) {
+            console.error('[processBcDeviceFile]: exception running llvm-dis for', name, err);
+            irText = `<llvm-dis failed: ${err}>`;
+        }
+
+        devices[irNameAndArch] = await this.postProcessAsm(
+            {
+                okToCache: demangle,
+                ...(await this.llvmIr.process(irText, {...filters, binary: false})),
+            },
+            {...filters, binary: false},
+        );
+    }
+
     override async extractDeviceCode(
         result: CompilationResult,
         filters: ParseFiltersAndOutputOptions,
@@ -244,118 +388,21 @@ export class ScaleNvccNvidiaCompiler extends BaseCompiler {
     ) {
         const {dirPath} = result;
         const {demangle} = filters;
-        const devices = {...result.devices};
+        const devices: Record<string, unknown> = {...result.devices};
 
         if (dirPath) {
             const files = await fs.readdir(dirPath);
-            const maxSize = this.env.ceProps('max-asm-size', 64 * 1024 * 1024);
 
-            console.log('[extractDeviceCode]: dirPath', dirPath);
-            console.log('[extractDeviceCode]: all files at start', files);
+            //console.log('[extractDeviceCode]: dirPath', dirPath);
+            //console.log('[extractDeviceCode]: all files at start', files);
 
-            await Promise.all(
-                files
-                    .filter(f => ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f))
-                    .map(async name => {
-                        console.log('[extractDeviceCode]: ---- processing file:', name);
+            const ptxFile = files.filter(f => ScaleNvccNvidiaCompiler.scaleDeviceFileRe.test(f)); //Ends with .s, not the host
+            const bcDeviceFile = files.filter(f => ScaleNvccNvidiaCompiler.scaleDeviceBcFileRe.test(f)); //ends with .bc, not the host
 
-                        const scaleMatch = name.match(ScaleNvccNvidiaCompiler.scaleDeviceFileRe);
-                        console.log('[extractDeviceCode]: scaleMatch', scaleMatch);
-
-                        const asm = await fs.readFile(Path.join(dirPath, name), 'utf8');
-                        console.log('[extractDeviceCode]: read PTX .s file, length', asm.length);
-                        console.log('[extractDeviceCode]: PTX .s preview:\n', asm.slice(0, 300));
-
-                        const archAndCode = scaleMatch[1];
-                        console.log('[extractDeviceCode]: archAndCode', archAndCode);
-
-                        const nameAndArch = `PTX` + (archAndCode ? ` (${archAndCode.toLowerCase()})` : '');
-                        console.log('[extractDeviceCode]: nameAndArch', nameAndArch);
-
-                        Object.assign(devices, {
-                            [nameAndArch]: await this.postProcessAsm(
-                                {
-                                    okToCache: demangle,
-                                    ...this.ptxParser.process(asm, {...filters, binary: false}),
-                                },
-                                {...filters, binary: false},
-                            ),
-                        });
-                        console.log('[extractDeviceCode]: PTX device entry written for', nameAndArch);
-
-                        //
-                        // PTX -> CUBIN with ptxas
-                        //
-                        const cubinPath = Path.join(dirPath, `${Path.basename(name, '.s')}.cubin`);
-                        const ptxasCmd = '/product/ubuntu24-x86_64/apps/CUDA/12.8.0/bin/ptxas';
-                        const ptxasArgs = ['-arch', archAndCode, name, '-o', cubinPath];
-                        console.log('[extractDeviceCode]: running ptxas:', ptxasCmd, ptxasArgs.join(' '));
-                        console.log('[extractDeviceCode]: ptxas cwd:', dirPath);
-
-                        try {
-                            const ptxasResult = await this.exec(ptxasCmd, ptxasArgs, {customCwd: dirPath});
-                            console.log('[extractDeviceCode]: ptxas exit code', ptxasResult.code);
-                            console.log('[extractDeviceCode]: ptxas stdout', ptxasResult.stdout);
-                            console.log('[extractDeviceCode]: ptxas stderr', ptxasResult.stderr);
-
-                            const filesAfterPtxas = await fs.readdir(dirPath);
-                            console.log('[extractDeviceCode]: files after ptxas', filesAfterPtxas);
-
-                            let cubinSize: number | null = null;
-                            try {
-                                cubinSize = (await fs.stat(cubinPath)).size;
-                            } catch {
-                                console.warn('[extractDeviceCode]: cubin file does not exist at', cubinPath);
-                            }
-                            console.log('[extractDeviceCode]: cubin size bytes', cubinSize);
-
-                            if (ptxasResult.code !== 0) {
-                                console.warn('[extractDeviceCode]: ptxas failed, skipping SASS');
-                                return;
-                            }
-
-                            //
-                            // CUBIN -> SASS with nvdisasm
-                            //
-                            const nvdisasmCmd = '/product/ubuntu24-x86_64/apps/CUDA/12.8.0/bin/nvdisasm';
-                            const nvdisasmArgs = [cubinPath];
-                            console.log('[extractDeviceCode]: running nvdisasm:', nvdisasmCmd, nvdisasmArgs.join(' '));
-                            console.log('[extractDeviceCode]: nvdisasm cwd:', dirPath);
-
-                            const {code, stdout} = await this.exec(nvdisasmCmd, nvdisasmArgs, {customCwd: dirPath});
-                            console.log('[extractDeviceCode]: nvdisasm exit code', code);
-                            console.log('[extractDeviceCode]: nvdisasm stdout length', stdout.length);
-                            console.log('[extractDeviceCode]: nvdisasm stdout \n', stdout);
-
-                            const filesAfterNvdisasm = await fs.readdir(dirPath);
-                            console.log('[extractDeviceCode]: files after nvdisasm', filesAfterNvdisasm);
-
-                            const sassAsm = code === 0
-                                ? this.postProcessObjdumpOutput(stdout)
-                                : `<nvdisasm failed with code ${code}>`;
-                            console.log('[extractDeviceCode]: sassAsm length after postProcess', sassAsm.length);
-                            console.log('[extractDeviceCode]: sassAsm:\n', sassAsm);
-
-                            const sassNameAndArch = `SASS` + (archAndCode ? ` (${archAndCode.toLowerCase()})` : '');
-                            console.log('[extractDeviceCode]: writing SASS device entry for', sassNameAndArch);
-
-                            Object.assign(devices, {
-                                [sassNameAndArch]: await this.postProcessAsm(
-                                    {
-                                        okToCache: demangle,
-                                        ...this.deviceAsmParser.process(sassAsm, {...filters, binary: false}),
-                                    },
-                                    {...filters, binary: false},
-                                ),
-                            });
-                            console.log('[extractDeviceCode]: SASS device entry written for', sassNameAndArch);
-                            console.log('[extractDeviceCode]: devices keys now', Object.keys(devices));
-
-                        } catch (err) {
-                            console.error('[extractDeviceCode]: exception during SASS generation', err);
-                        }
-                    }),
-            );
+            await Promise.all([
+                ...ptxFile.map(name => this.processPtxFile(name, dirPath, filters, !!demangle, devices)),
+                ...bcDeviceFile.map(name => this.processBcDeviceFile(name, dirPath, filters, !!demangle, devices)),
+            ]);
 
             console.log('[extractDeviceCode]: final devices keys', Object.keys(devices));
             result.devices = devices;
